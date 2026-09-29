@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  />
+
+  <title>JESA VP1</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #111;
+      color: #fff;
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .app {
+      width: min(900px, 95vw);
+      height: 90vh;
+      display: flex;
+      flex-direction: column;
+      border: 1px solid #333;
+      border-radius: 16px;
+      overflow: hidden;
+      background: #181818;
+    }
+
+    header {
+      padding: 18px 22px;
+      border-bottom: 1px solid #333;
+    }
+
+    header h1 {
+      margin: 0;
+      font-size: 22px;
+    }
+
+    header p {
+      margin: 5px 0 0;
+      color: #888;
+      font-size: 13px;
+    }
+
+    .controls {
+      padding: 14px 18px;
+      display: flex;
+      gap: 10px;
+      border-bottom: 1px solid #333;
+    }
+
+    input {
+      flex: 1;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid #444;
+      background: #222;
+      color: white;
+      outline: none;
+    }
+
+    button {
+      padding: 12px 18px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      background: white;
+      color: black;
+      font-weight: bold;
+    }
+
+    .status {
+      padding: 8px 18px;
+      font-size: 12px;
+      color: #888;
+    }
+
+    .messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+    }
+
+    .message {
+      margin-bottom: 12px;
+      padding: 12px 15px;
+      background: #242424;
+      border-radius: 10px;
+    }
+
+    .message .meta {
+      font-size: 11px;
+      color: #777;
+      margin-bottom: 5px;
+    }
+
+    .composer {
+      display: flex;
+      gap: 10px;
+      padding: 15px;
+      border-top: 1px solid #333;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div class="app">
+
+    <header>
+      <h1>JESA</h1>
+      <p>Version Prototype 1 — Communication Core</p>
+    </header>
+
+    <div class="controls">
+
+      <input
+        id="conversationInput"
+        type="text"
+        value="chat-001"
+        placeholder="Conversation ID"
+      />
+
+      <button id="joinButton">
+        Join
+      </button>
+
+    </div>
+
+    <div
+      id="status"
+      class="status"
+    >
+      Connecting...
+    </div>
+
+    <div
+      id="messages"
+      class="messages"
+    ></div>
+
+    <div class="composer">
+
+      <input
+        id="messageInput"
+        type="text"
+        placeholder="Talk to JESA..."
+      />
+
+      <button id="sendButton">
+        Send
+      </button>
+
+    </div>
+
+  </div>
+
+  <script>
+
+    const statusElement =
+      document.getElementById("status");
+
+    const messagesElement =
+      document.getElementById("messages");
+
+    const conversationInput =
+      document.getElementById("conversationInput");
+
+    const messageInput =
+      document.getElementById("messageInput");
+
+    const joinButton =
+      document.getElementById("joinButton");
+
+    const sendButton =
+      document.getElementById("sendButton");
+
+
+    let socket = null;
+
+    let currentConversation = null;
+
+
+    // ---------------------------------------------
+    // CONNECT TO JESA
+    // ---------------------------------------------
+
+    function connect() {
+
+      socket = new WebSocket(
+        `ws://${window.location.host}`
+      );
+
+
+      socket.addEventListener("open", () => {
+
+        statusElement.textContent =
+          "Connected to JESA";
+
+      });
+
+
+      socket.addEventListener("message", (event) => {
+
+        const data =
+          JSON.parse(event.data);
+
+        console.log("JESA:", data);
+
+
+        if (data.type === "connected") {
+
+          statusElement.textContent =
+            `Connected — ${data.clientId}`;
+
+          return;
+        }
+
+
+        if (data.type === "joined") {
+
+          currentConversation =
+            data.conversationId;
+
+          statusElement.textContent =
+            `Conversation: ${currentConversation}`;
+
+          addMessage(
+            "SYSTEM",
+            `Joined ${currentConversation}`
+          );
+
+          return;
+        }
+
+
+        if (data.type === "message") {
+
+          addMessage(
+            data.clientId,
+            data.text
+          );
+
+          return;
+        }
+
+
+        if (data.type === "error") {
+
+          addMessage(
+            "ERROR",
+            data.text
+          );
+
+        }
+
+      });
+
+
+      socket.addEventListener("close", () => {
+
+        statusElement.textContent =
+          "Disconnected from JESA";
+
+      });
+
+    }
+
+
+    // ---------------------------------------------
+    // JOIN CONVERSATION
+    // ---------------------------------------------
+
+    function joinConversation() {
+
+      const conversationId =
+        conversationInput.value.trim();
+
+      if (!conversationId) {
+        return;
+      }
+
+      if (!socket ||
+          socket.readyState !== WebSocket.OPEN) {
+
+        return;
+      }
+
+      socket.send(
+        JSON.stringify({
+          type: "join",
+          conversationId
+        })
+      );
+
+    }
+
+
+    // ---------------------------------------------
+    // SEND MESSAGE
+    // ---------------------------------------------
+
+    function sendMessage() {
+
+      const text =
+        messageInput.value.trim();
+
+      if (!text) {
+        return;
+      }
+
+      if (!currentConversation) {
+
+        addMessage(
+          "SYSTEM",
+          "Join a conversation first."
+        );
+
+        return;
+      }
+
+      socket.send(
+        JSON.stringify({
+          type: "message",
+          conversationId:
+            currentConversation,
+          text
+        })
+      );
+
+
+      messageInput.value = "";
+
+      messageInput.focus();
+
+    }
+
+
+    // ---------------------------------------------
+    // DISPLAY MESSAGE
+    // ---------------------------------------------
+
+    function addMessage(sender, text) {
+
+      const message =
+        document.createElement("div");
+
+      message.className =
+        "message";
+
+      message.innerHTML = `
+        <div class="meta">
+          ${sender}
+        </div>
+
+        <div>
+          ${escapeHtml(text)}
+        </div>
+      `;
+
+      messagesElement.appendChild(message);
+
+      messagesElement.scrollTop =
+        messagesElement.scrollHeight;
+
+    }
+
+
+    // ---------------------------------------------
+    // BASIC HTML ESCAPING
+    // ---------------------------------------------
+
+    function escapeHtml(text) {
+
+      const div =
+        document.createElement("div");
+
+      div.textContent = text;
+
+      return div.innerHTML;
+
+    }
+
+
+    // ---------------------------------------------
+    // EVENTS
+    // ---------------------------------------------
+
+    joinButton.addEventListener(
+      "click",
+      joinConversation
+    );
+
+
+    sendButton.addEventListener(
+      "click",
+      sendMessage
+    );
+
+
+    messageInput.addEventListener(
+      "keydown",
+      (event) => {
+
+        if (event.key === "Enter") {
+
+          sendMessage();
+
+        }
+
+      }
+    );
+
+
+    // ---------------------------------------------
+    // START
+    // ---------------------------------------------
+
+    connect();
+
+  </script>
+
+</body>
+</html>
