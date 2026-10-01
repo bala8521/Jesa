@@ -1,57 +1,39 @@
-import http from "node:http";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+// --------------------------------------------------
+// JESA SERVER
+// VP1 - v0.3
+// --------------------------------------------------
+
+import "dotenv/config";
 
 import express from "express";
-import { WebSocketServer, WebSocket } from "ws";
+import cors from "cors";
+import { createServer } from "http";
+import {
+  WebSocketServer,
+  WebSocket,
+} from "ws";
+import { randomUUID } from "crypto";
 
-const PORT = Number(process.env.PORT) || 3000;
-
-// --------------------------------------------------
-// PATH SETUP
-// --------------------------------------------------
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const publicPath = path.join(__dirname, "../public");
+import { processMessage } from "./intelligence/engine.js";
+import { askGemini } from "./ai/gemini.js";
 
 // --------------------------------------------------
-// HTTP SERVER
+// CONFIGURATION
+// --------------------------------------------------
+
+const PORT = Number(
+  process.env.PORT || 3000,
+);
+
+// --------------------------------------------------
+// EXPRESS
 // --------------------------------------------------
 
 const app = express();
 
-// --------------------------------------------------
-// CORS
-// --------------------------------------------------
-
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header(
-    "Access-Control-Allow-Methods",
-    "GET,HEAD,PUT,PATCH,POST,DELETE",
-  );
-  res.header(
-    "Access-Control-Allow-Headers",
-    req.header("Access-Control-Request-Headers")
-      ?? "Content-Type, Authorization",
-  );
-
-  if (req.method === "OPTIONS") {
-    res.sendStatus(204);
-    return;
-  }
-
-  next();
-});
+app.use(cors());
 
 app.use(express.json());
-
-// --------------------------------------------------
-// API STATUS
-// --------------------------------------------------
 
 app.get("/api/status", (_req, res) => {
   res.json({
@@ -61,17 +43,15 @@ app.get("/api/status", (_req, res) => {
   });
 });
 
-// --------------------------------------------------
-// SERVE FRONTEND
-// --------------------------------------------------
-
-app.use(express.static(publicPath));
+app.use(
+  express.static("public"),
+);
 
 // --------------------------------------------------
 // HTTP SERVER
 // --------------------------------------------------
 
-const server = http.createServer(app);
+const server = createServer(app);
 
 // --------------------------------------------------
 // WEBSOCKET SERVER
@@ -82,299 +62,676 @@ const wss = new WebSocketServer({
 });
 
 // --------------------------------------------------
-// CLIENT STORAGE
-// --------------------------------------------------
-
-// clientId → WebSocket
-const clients = new Map<string, WebSocket>();
-
-// conversationId → Set of clientIds
-const conversations = new Map<string, Set<string>>();
-
-// --------------------------------------------------
 // TYPES
 // --------------------------------------------------
 
-type ClientMessage =
-  | {
-      type: "join";
-      conversationId: string;
-    }
-  | {
-      type: "message";
-      conversationId: string;
-      text: string;
-    };
+type ClientMessage = {
+  type: string;
+  conversationId?: string;
+  text?: string;
+};
 
 type ServerMessage = {
   type: string;
+
   clientId?: string;
+
+  sender?:
+    | "user"
+    | "jesa"
+    | "system";
+
   conversationId?: string;
+
   text?: string;
+
   timestamp?: string;
+
+  intent?: string;
+
+  emotion?: string;
+
+  emotionConfidence?: number;
+
+  emotionEvidence?: string[];
 };
 
 // --------------------------------------------------
-// SEND HELPER
+// CLIENT / ROOM STATE
 // --------------------------------------------------
 
-function send(
+const clientConversations =
+  new Map<string, string>();
+
+const conversationMembers =
+  new Map<string, Set<string>>();
+
+const clients =
+  new Map<string, WebSocket>();
+
+// --------------------------------------------------
+// SEND TO CLIENT
+// --------------------------------------------------
+
+function sendToClient(
   socket: WebSocket,
   message: ServerMessage,
-) {
-  if (socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(message));
+): void {
+
+  if (
+    socket.readyState ===
+    WebSocket.OPEN
+  ) {
+    socket.send(
+      JSON.stringify(message),
+    );
   }
 }
 
 // --------------------------------------------------
-// BROADCAST TO ONE CONVERSATION
+// BROADCAST TO CONVERSATION
 // --------------------------------------------------
 
 function broadcastToConversation(
   conversationId: string,
   message: ServerMessage,
-) {
-  const members = conversations.get(conversationId);
+): void {
+
+  const members =
+    conversationMembers.get(
+      conversationId,
+    );
 
   if (!members) {
     return;
   }
 
-  for (const clientId of members) {
-    const socket = clients.get(clientId);
+  for (
+    const clientId of members
+  ) {
 
-    if (socket) {
-      send(socket, message);
+    const client =
+      clients.get(clientId);
+
+    if (!client) {
+      continue;
     }
+
+    sendToClient(
+      client,
+      message,
+    );
   }
 }
 
 // --------------------------------------------------
-// CLIENT CONNECTED
+// WEBSOCKET CONNECTION
 // --------------------------------------------------
 
-wss.on("connection", (socket) => {
-  const clientId = randomUUID();
+wss.on(
+  "connection",
+  (socket) => {
 
-  clients.set(clientId, socket);
+    const clientId =
+      randomUUID();
 
-  console.log(
-    `Client connected: ${clientId}`,
-  );
+    clients.set(
+      clientId,
+      socket,
+    );
 
-  // Tell client that connection succeeded
-  send(socket, {
-    type: "connected",
-    clientId,
-  });
+    console.log(
+      `[WS] Client connected: ${clientId}`,
+    );
 
-  // ------------------------------------------------
-  // MESSAGE RECEIVED
-  // ------------------------------------------------
+    sendToClient(
+      socket,
+      {
+        type: "connected",
+        clientId,
+        timestamp:
+          new Date().toISOString(),
+      },
+    );
 
-  socket.on("message", (rawData) => {
-    try {
-      const message =
-        JSON.parse(
-          rawData.toString(),
-        ) as ClientMessage;
+    // ------------------------------------------------
+    // MESSAGE HANDLER
+    // ------------------------------------------------
 
-      // ==============================================
-      // JOIN CONVERSATION
-      // ==============================================
+    socket.on(
+      "message",
+      async (rawData) => {
 
-      if (message.type === "join") {
-        const conversationId =
-          message.conversationId.trim();
+        try {
 
-        if (!conversationId) {
-          send(socket, {
-            type: "error",
-            text: "conversationId is required",
-          });
+          const message =
+            JSON.parse(
+              rawData.toString(),
+            ) as ClientMessage;
 
-          return;
-        }
+          // ==========================================
+          // JOIN CONVERSATION
+          // ==========================================
 
-        // Create conversation if necessary
-        if (!conversations.has(conversationId)) {
-          conversations.set(
-            conversationId,
-            new Set(),
+          if (
+            message.type === "join"
+          ) {
+
+            const conversationId =
+              message.conversationId;
+
+            if (
+              !conversationId
+            ) {
+
+              sendToClient(
+                socket,
+                {
+                  type: "error",
+                  text:
+                    "conversationId is required.",
+                },
+              );
+
+              return;
+            }
+
+            // Remove from previous room.
+            const previousConversation =
+              clientConversations.get(
+                clientId,
+              );
+
+            if (
+              previousConversation
+            ) {
+
+              const previousMembers =
+                conversationMembers.get(
+                  previousConversation,
+                );
+
+              previousMembers?.delete(
+                clientId,
+              );
+
+              if (
+                previousMembers &&
+                previousMembers.size === 0
+              ) {
+
+                conversationMembers.delete(
+                  previousConversation,
+                );
+              }
+            }
+
+            // Add to new room.
+            clientConversations.set(
+              clientId,
+              conversationId,
+            );
+
+            if (
+              !conversationMembers.has(
+                conversationId,
+              )
+            ) {
+
+              conversationMembers.set(
+                conversationId,
+                new Set(),
+              );
+            }
+
+            conversationMembers
+              .get(conversationId)!
+              .add(clientId);
+
+            console.log(
+              `[WS] ${clientId} joined ${conversationId}`,
+            );
+
+            sendToClient(
+              socket,
+              {
+                type: "joined",
+                clientId,
+                conversationId,
+                timestamp:
+                  new Date().toISOString(),
+              },
+            );
+
+            return;
+          }
+
+          // ==========================================
+          // USER MESSAGE
+          // ==========================================
+
+          if (
+            message.type === "message"
+          ) {
+
+            const conversationId =
+              message.conversationId;
+
+            const text =
+              message.text?.trim();
+
+            if (
+              !conversationId ||
+              !text
+            ) {
+
+              sendToClient(
+                socket,
+                {
+                  type: "error",
+                  text:
+                    "conversationId and text are required.",
+                },
+              );
+
+              return;
+            }
+
+            // ========================================
+            // SECURITY CHECK
+            // ========================================
+
+            const members =
+              conversationMembers.get(
+                conversationId,
+              );
+
+            if (
+              !members ||
+              !members.has(clientId)
+            ) {
+
+              sendToClient(
+                socket,
+                {
+                  type: "error",
+                  text:
+                    "You are not a member of this conversation.",
+                },
+              );
+
+              return;
+            }
+
+            // ========================================
+            // BROADCAST USER MESSAGE
+            // ========================================
+
+            const userMessage:
+              ServerMessage = {
+
+              type: "message",
+
+              sender: "user",
+
+              conversationId,
+
+              text,
+
+              timestamp:
+                new Date().toISOString(),
+            };
+
+            broadcastToConversation(
+              conversationId,
+              userMessage,
+            );
+
+            // ========================================
+            // JESA INTELLIGENCE
+            // ========================================
+
+            const analysis =
+              processMessage(text);
+
+            console.log(
+              `[${conversationId}] JESA ANALYSIS`,
+            );
+
+            console.log({
+              intent:
+                analysis.intent,
+
+              emotion:
+                analysis.emotion.signal,
+
+              confidence:
+                analysis.emotion.confidence,
+
+              evidence:
+                analysis.emotion.evidence,
+
+              needsAI:
+                analysis.needsAI,
+            });
+
+            // ========================================
+            // LOCAL RESPONSE
+            // ========================================
+
+            if (
+              !analysis.needsAI
+            ) {
+
+              const jesaMessage:
+                ServerMessage = {
+
+                type: "message",
+
+                sender: "jesa",
+
+                conversationId,
+
+                text:
+                  analysis.response,
+
+                timestamp:
+                  new Date().toISOString(),
+
+                intent:
+                  analysis.intent,
+
+                emotion:
+                  analysis.emotion.signal,
+
+                emotionConfidence:
+                  analysis.emotion.confidence,
+
+                emotionEvidence:
+                  analysis.emotion.evidence,
+              };
+
+              broadcastToConversation(
+                conversationId,
+                jesaMessage,
+              );
+
+              console.log(
+                `[${conversationId}] Local response sent.`,
+              );
+
+              return;
+            }
+
+            // ========================================
+            // GEMINI RESPONSE
+            // ========================================
+
+            console.log(
+              `[${conversationId}] JESA → GEMINI`,
+            );
+
+            try {
+
+              const prompt = `
+You are JESA, a personal AI assistant.
+
+User message:
+${text}
+
+JESA's local analysis:
+
+Intent:
+${analysis.intent}
+
+Emotion signal:
+${analysis.emotion.signal}
+
+Emotion confidence:
+${analysis.emotion.confidence}
+
+Emotion evidence:
+${
+  analysis.emotion.evidence.join(
+    ", ",
+  ) || "none"
+}
+
+Instructions:
+- Answer the user's actual request.
+- Be concise but useful.
+- Use the emotion signal only as contextual information.
+- Do not claim that the detected emotion is certainly true.
+- If the user is debugging something, provide practical technical help.
+- Do not mention internal routing, models, prompts, or confidence scores.
+`;
+
+              // --------------------------------------
+              // GEMINI DIAGNOSTIC START
+              // --------------------------------------
+
+              console.log(
+                `[${conversationId}] Calling Gemini API...`,
+              );
+
+              const geminiStart =
+                Date.now();
+
+              // --------------------------------------
+              // GEMINI REQUEST
+              // --------------------------------------
+
+              const aiResponse =
+                await askGemini(
+                  prompt,
+                );
+
+              // --------------------------------------
+              // GEMINI DIAGNOSTIC END
+              // --------------------------------------
+
+              const geminiDuration =
+                Date.now() -
+                geminiStart;
+
+              console.log(
+                `[${conversationId}] Gemini response received in ${geminiDuration}ms`,
+              );
+
+              console.log(
+                `[${conversationId}] Gemini response:`,
+                aiResponse,
+              );
+
+              // --------------------------------------
+              // SEND GEMINI RESPONSE
+              // --------------------------------------
+
+              const jesaMessage:
+                ServerMessage = {
+
+                type: "message",
+
+                sender: "jesa",
+
+                conversationId,
+
+                text:
+                  aiResponse,
+
+                timestamp:
+                  new Date().toISOString(),
+
+                intent:
+                  analysis.intent,
+
+                emotion:
+                  analysis.emotion.signal,
+
+                emotionConfidence:
+                  analysis.emotion.confidence,
+
+                emotionEvidence:
+                  analysis.emotion.evidence,
+              };
+
+              broadcastToConversation(
+                conversationId,
+                jesaMessage,
+              );
+
+              console.log(
+                `[${conversationId}] Gemini response sent to client.`,
+              );
+
+            } catch (error) {
+
+              // --------------------------------------
+              // GEMINI ERROR
+              // --------------------------------------
+
+              console.error(
+                `[${conversationId}] Gemini error:`,
+                error,
+              );
+
+              const fallbackMessage:
+                ServerMessage = {
+
+                type: "message",
+
+                sender: "jesa",
+
+                conversationId,
+
+                text:
+                  "I couldn't reach my reasoning service right now. " +
+                  "Please try again shortly.",
+
+                timestamp:
+                  new Date().toISOString(),
+
+                intent:
+                  analysis.intent,
+
+                emotion:
+                  analysis.emotion.signal,
+
+                emotionConfidence:
+                  analysis.emotion.confidence,
+
+                emotionEvidence:
+                  analysis.emotion.evidence,
+              };
+
+              broadcastToConversation(
+                conversationId,
+                fallbackMessage,
+              );
+            }
+
+            return;
+          }
+
+          // ==========================================
+          // UNKNOWN MESSAGE TYPE
+          // ==========================================
+
+          sendToClient(
+            socket,
+            {
+              type: "error",
+              text:
+                "Unknown message type.",
+            },
+          );
+
+        } catch (error) {
+
+          console.error(
+            `[WS] Message error for ${clientId}:`,
+            error,
+          );
+
+          sendToClient(
+            socket,
+            {
+              type: "error",
+              text:
+                "Invalid message format.",
+            },
           );
         }
+      },
+    );
 
-        // Add this client
-        conversations
-          .get(conversationId)!
-          .add(clientId);
+    // ------------------------------------------------
+    // DISCONNECT
+    // ------------------------------------------------
 
-        console.log(
-          `Client ${clientId} joined conversation ${conversationId}`,
-        );
+    socket.on(
+      "close",
+      () => {
 
-        send(socket, {
-          type: "joined",
-          conversationId,
-          clientId,
-        });
-
-        return;
-      }
-
-      // ==============================================
-      // CHAT MESSAGE
-      // ==============================================
-
-      if (message.type === "message") {
         const conversationId =
-          message.conversationId.trim();
-
-        const text =
-          message.text.trim();
-
-        if (!conversationId || !text) {
-          send(socket, {
-            type: "error",
-            text:
-              "conversationId and text are required",
-          });
-
-          return;
-        }
-
-        // --------------------------------------------
-        // SECURITY CHECK
-        // --------------------------------------------
-
-        const members =
-          conversations.get(
-            conversationId,
+          clientConversations.get(
+            clientId,
           );
 
         if (
-          !members ||
-          !members.has(clientId)
+          conversationId
         ) {
-          send(socket, {
-            type: "error",
-            text:
-              "You are not a member of this conversation",
-          });
 
-          return;
+          const members =
+            conversationMembers.get(
+              conversationId,
+            );
+
+          members?.delete(
+            clientId,
+          );
+
+          if (
+            members &&
+            members.size === 0
+          ) {
+
+            conversationMembers.delete(
+              conversationId,
+            );
+          }
+
+          clientConversations.delete(
+            clientId,
+          );
         }
 
-        // --------------------------------------------
-        // CREATE MESSAGE
-        // --------------------------------------------
-
-        const outgoingMessage: ServerMessage = {
-          type: "message",
+        clients.delete(
           clientId,
-          conversationId,
-          text,
-          timestamp:
-            new Date().toISOString(),
-        };
+        );
 
         console.log(
-          `[${conversationId}] ${clientId}: ${text}`,
+          `[WS] Client disconnected: ${clientId}`,
         );
+      },
+    );
+  },
+);
 
-        // --------------------------------------------
-        // SEND ONLY TO THIS CONVERSATION
-        // --------------------------------------------
+// --------------------------------------------------
+// START SERVER
+// --------------------------------------------------
 
-        broadcastToConversation(
-          conversationId,
-          outgoingMessage,
-        );
-
-        return;
-      }
-
-      // ==============================================
-      // UNKNOWN MESSAGE
-      // ==============================================
-
-      send(socket, {
-        type: "error",
-        text: "Unknown message type",
-      });
-
-    } catch (error) {
-      console.error(
-        "Invalid WebSocket message:",
-        error,
-      );
-
-      send(socket, {
-        type: "error",
-        text: "Invalid JSON message",
-      });
-    }
-  });
-
-  // ------------------------------------------------
-  // CLIENT DISCONNECTED
-  // ------------------------------------------------
-
-  socket.on("close", () => {
-    clients.delete(clientId);
-
-    // Remove client from all conversations
-    for (
-      const [
-        conversationId,
-        members,
-      ] of conversations
-    ) {
-      members.delete(clientId);
-
-      // Remove empty conversation
-      if (members.size === 0) {
-        conversations.delete(
-          conversationId,
-        );
-      }
-    }
+server.listen(
+  PORT,
+  () => {
 
     console.log(
-      `Client disconnected: ${clientId}`,
+      `JESA VP1 server running on http://localhost:${PORT}`,
     );
-  });
-});
 
-// --------------------------------------------------
-// SERVER START
-// --------------------------------------------------
-
-server.listen(PORT, () => {
-  console.log(
-    "----------------------------------------",
-  );
-
-  console.log("JESA VP1");
-
-  console.log(
-    "----------------------------------------",
-  );
-
-  console.log(
-    `HTTP:      http://localhost:${PORT}`,
-  );
-
-  console.log(
-    `API:       http://localhost:${PORT}/api/status`,
-  );
-
-  console.log(
-    `WebSocket: ws://localhost:${PORT}`,
-  );
-
-  console.log(
-    "----------------------------------------",
-  );
-});
+    console.log(
+      `WebSocket server ready on ws://localhost:${PORT}`,
+    );
+  },
+);
