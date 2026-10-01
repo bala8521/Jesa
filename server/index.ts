@@ -15,7 +15,7 @@ import {
 import { randomUUID } from "crypto";
 
 import { processMessage } from "./intelligence/engine.js";
-import { askGemini } from "./ai/gemini.js";
+import { askJesaAI } from "./ai/router.js";
 
 // --------------------------------------------------
 // CONFIGURATION
@@ -522,7 +522,7 @@ Instructions:
               // --------------------------------------
 
               const aiResponse =
-                await askGemini(
+                await askJesaAI(
                   prompt,
                 );
 
